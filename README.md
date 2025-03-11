@@ -2,7 +2,7 @@
 ## Hannah Nguyen, MSPPM-Data Analytics 2025, CMU
 
 ### Abstract
-This project investigates the relationship between air quality and traffic volume across counties in Pennsylvania from 2018 to 2023 using panel regression among other techniques. Panel regression helps control for both temporal and spatial variations,2 allowing for more precise estimations of traffic’s effects on air quality. The findings of this study can inform policymakers and urban planners in designing targeted interventions to mitigate air pollution, improve public health, and enhance transportation policies in Pennsylvania.
+This project investigates the relationship between air quality and traffic volume across counties in Pennsylvania from 2018 to 2023 using panel regression among other techniques. Panel regression helps control for both temporal and spatial variations, allowing for more precise estimations of traffic’s effects on air quality. The findings of this study can inform policymakers and urban planners in designing targeted interventions to mitigate air pollution, improve public health, and enhance transportation policies in Pennsylvania.
 
 ### Learning Reflection
 This is my final project for "Programming in R," where I learned advanced R coding skills but also revised foundational concepts in data analytics (such as exploratory visualization, linear regression, and clustering). I especially enjoyed building an R application through Shiny for an interactive final "poster".
