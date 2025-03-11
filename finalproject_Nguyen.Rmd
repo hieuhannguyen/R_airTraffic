@@ -1,0 +1,736 @@
+---
+title: "Traffic Volume and Air Quality"
+author: "Hannah Nguyen"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    fig_caption: yes
+    includes:
+      in_header: my_header.tex
+geometry: margin=0.75in
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+
+# retrieving necessary libraries
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(sf)
+library(ggcorrplot)
+library(foreign)
+library(tinytex)
+library(plm)
+library(knitr)
+library(kableExtra)
+library(olsrr)
+library(gplots)
+library(dbscan)
+library(fpc)
+library(stargazer)
+
+## Reference for utilizing knitr and kabelExtra: https://andrewirwin.github.io/data-visualization/format-tables.html & https://bookdown.org/yihui/rmarkdown/tufte-figures.html
+
+## Reference for document LaTex edits: https://forum.posit.co/t/cant-control-position-of-tables-and-figures-in-knitted-pdf-document/37364/3
+
+```
+
+## Introduction
+Air quality is a critical factor influencing public health and environmental sustainability, particularly in regions with significant traffic congestion.\footnote{National Institute of Environmental Health Sciences, “Air Pollution and Your Health,” National Institute of Environmental Health Sciences, February 26, 2025, \url{https://www.niehs.nih.gov/health/topics/agents/air-pollution}.} This project investigates the relationship between air quality and traffic volume across counties in Pennsylvania from 2018 to 2023 using panel regression among other techniques. Panel regression helps control for both temporal and spatial variations,\footnote{Oscar Torres-Reyna, "Getting Started in Fixed/Random
+Effects Models using R/RStudio," Princeton University, 2010, accessed Feb. 21, 2025, \url{https://www.princeton.edu/~otorres/Panel101R.pdf}, 2.} allowing for more precise estimations of traffic's effects on air quality. The findings of this study can inform policymakers and urban planners in designing targeted interventions to mitigate air pollution, improve public health, and enhance transportation policies in Pennsylvania.
+
+## Data Available
+### a. Daily Air Quality Index by County
+```{r, include=FALSE}
+#echo=FALSE
+
+## Reference: Used chatGPT for reference on how to read multiple dataframes as once into a list
+
+# creating a list of file paths to air quality dataset
+files <- list.files(path = "./air_quality/", pattern = "*.csv", full.names = TRUE)
+
+# reading all datasets in as once
+aqi_dfs <- lapply(files, read.csv)
+
+# renaming the dfs to its meta name without the ".csv"
+names(aqi_dfs) <- gsub(".csv", "", basename(files))
+
+# function to clean all dfs in AQI data: 
+# (1) take a subsection only consisting of Pennsylvania counties' AQI
+# (2) only take specific columns
+
+## Reference: Used chatGPT to reference how to apply a function across all values of a list 
+## Reference: https://www.datacamp.com/doc/r/dates for date data conversion
+
+clean_data <- function(df) {
+  new_df <- subset(df, subset=State.Name=="Pennsylvania", 
+                   select=c(county.Name, County.Code, 
+                            Date, AQI, Category, Defining.Parameter))
+  new_df$Date <- as.Date(new_df$Date, format="%Y-%m-%d")
+  return(new_df)
+}
+
+# applying the function then merge all dfs into final dataframe
+## Reference: Used chatGPT to learn about the bind_rows function
+aqi_cleaned = lapply(aqi_dfs, clean_data)
+AQIs_all <-bind_rows(aqi_cleaned)
+
+# freeing up R Studio memory for less buggy execution
+rm(aqi_dfs)
+rm(aqi_cleaned)
+rm(files)
+rm(clean_data)
+```
+Air quality in the US is measured by the Air Quality Index (AQI), defined by the US Environmental Protection Agency (EPA).\footnote{US EPA, “AQI Basics,” AirNow.gov, accessed February 7, 2025, \url{https://www.airnow.gov/aqi/aqi-basics}.} The EPA determines an AQI for a geographic location through the ratio of different pollutant factors found in air monitors in the area. The higher the AQI, the more hazardous such air is to public health.\footnote{Ibid.}
+
+Data for daily AQI per county in the US is collected through the EPA's pre-generated data website.\footnote{US EPA, “Pre-Generated Data Files,” Data \& Tools, Air Data, November 19, 2024, \url{https://aqs.epa.gov/aqsweb/airdata/download_files.html}.} The dataset also contains corresponding quality categorization ("Good", "Moderate", "Unhealthy",... quality of air) and the specific pollutant component that informs the index calculation. See section 1 in the Appendix for more detail.
+
+### b. Traffic Volume Data
+```{r, include=FALSE}
+
+# read in the data
+traffic_volume <- read.csv("RMSTRAFFIC.csv")
+
+# take a subset of only necessary columns after understanding the meta data
+tv_subset <- subset(traffic_volume, 
+                    select=c(CTY_CODE, CUR_AADT, BASE_ADT, 
+                             ADTT_CUR, ADTT_BASE, TRAFF_PATT_GRP, VOL_CNT_DATE))
+
+# Data cleaning: 
+# (1) Replacing NA values in Traffic Pattern Group with '-1' and change its type to character (categories)
+# (2) Change count date to date information
+tv_subset_cleaned = tv_subset%>%
+  mutate(TRAFF_PATT_GRP=as.character(replace(TRAFF_PATT_GRP,is.na(TRAFF_PATT_GRP),-1)))%>%
+  mutate(VOL_CNT_DATE=as.Date(as.character(VOL_CNT_DATE),format="%Y%m%d"))%>%
+  mutate(TRAFF_PATT_GRP = case_when(
+    TRAFF_PATT_GRP == 1 ~ "Urban - Interstate",
+    TRAFF_PATT_GRP == 2 ~ "Rural - Interstate",
+    TRAFF_PATT_GRP == 3 ~ "Urban - Other Principle Arterials",
+    TRAFF_PATT_GRP == 4 ~ "Rural - Other Principle Arterials",
+    TRAFF_PATT_GRP == 5 ~ "Urban - Minor Arterials, Collectors, Local Roads",
+    TRAFF_PATT_GRP == 6 ~ "North Rural - Minor Arterials",
+    TRAFF_PATT_GRP == 7 ~ "Central Rural - Minor Arterials",
+    TRAFF_PATT_GRP == 8 ~ "North Rural - Collectors and Local Roads",
+    TRAFF_PATT_GRP == 9 ~ "Central Rural - Collectors and Local Roads",
+    TRAFF_PATT_GRP == 10 ~ "Special Recreational",
+    TRAFF_PATT_GRP == 11 ~ "Urban - Local",
+    TRAFF_PATT_GRP == 12 ~ "Rural - Local"
+  ))
+
+# renaming the columns for more clarity
+names(tv_subset_cleaned) = c("County.Code", "Current.Traffic", "Base.Traffic", 
+                             "Current.Truck", "Base.Truck", "Traffic.Pattern", "Date")
+
+# freeing up memory
+rm(traffic_volume)
+rm(tv_subset)
+```
+The Pennsylvania Department of Transportation (PennDOT) collects and publishes open data on traffic volume, defined as "amounts of vehicle traffic that travel the section of road,"\footnote{PennDOT, “RMSTRAFFIC (Traffic Volumes),” PennShare, January 21, 2025, \url{https://data-pennshare.opendata.arcgis.com/datasets/a17c20bf71dd40fea24363bb9f0ae0e4_0/about}.} for specific roadways in the state. The data does not include every street nor every county due to availability of traffic counting methods.
+
+The variables include estimate counts of vehicle and truck traffic in specific date (Current AADT - Annual Average Daily Traffic and Current AADTT - Annual Average Daily Truck Traffic) as well as base counts or historical counts for vehicle and truck traffics (Base AADT and Base AADTT). That is, if the current traffic on a street is 2,000 while its base traffic is 1,500, that street is 500 vehicles more crowded on that date than its usual traffic rate. The data also includes categories of Traffic Pattern Groups to specify types of roads for the traffic count (urban interstates, rural local roads, etc.). More information on the metadata of this dataset is available on PennDOT's GIS site.\footnote{PennDOT, “Traffic Volumes,” Data \& Tools, PennDOT GIS Data Dictionary Hub, accessed February 7, 2025, \url{https://docs-pennshare.hub.arcgis.com/pages/traffic-volumes}.} While the data collected goes back to 1990, the final dataset will only include data from 2018 to 2023. An example of how traffic volume was recorded for York county (the full PA road network is too dense for this visualization) was included in section 2 of the Appendix.
+
+### c. Daily average temperature and precipitation
+```{r, include=FALSE}
+
+# Reading in daily temperatures similarly to AQI data but with customized column names
+## Reference: https://stackoverflow.com/questions/28989997/r-read-file-without-header
+files <- list.files(path = "./daily_temp/", pattern = "*.csv", full.names = TRUE)
+daily_temps <- lapply(files, read.csv, header= FALSE, col.names = paste0("X",1:37))
+names(daily_temps) <- gsub(".csv", "", basename(files))
+
+# Similarly, reading in daily precipitation
+files <- list.files(path = "./daily_precipitation/", pattern = "*.csv", full.names = TRUE)
+daily_prcp <- lapply(files, read.csv, header= FALSE, col.names = paste0("X",1:37))
+names(daily_prcp) <- gsub(".csv", "", basename(files))
+
+#function to clean weather data: 
+# (1) remove extra columns for months that doesnt have 31 days
+# (2) Split the county name column into state and county
+# (3) Drop unnecessary columns & filter out PA counties
+# (4) Pivot the datasets from long form to wide form
+# (5) Add the appropriate date field
+
+clean_weather_data <- function(df, value_name) {
+  # remove extra date
+  ## Reference: used ChatGPT to understand !apply syntax
+  df <- df[, !apply(df <= -997, 2, any)]
+    
+  df_cleaned = df %>%
+    
+    # split into state, county
+    separate(X3, into=c("State","county.Name"),sep=": ")%>%
+
+    # remove the word "County" to match AQI dataset
+    mutate(county.Name = gsub("County","",county.Name))%>%
+
+    # filter out PA counties
+    filter(State=="PA")%>%
+
+    # pivot from wide to long form
+    ## Reference: Used chatGPT to learn about and see examples of pivot_longer
+    pivot_longer(
+      cols = matches("X7"):last_col(),
+      names_to = "day",
+      names_prefix = "X",
+      values_to=value_name
+    )%>%
+
+    # add a column to record the date (year-month-day)
+    mutate(
+      day=as.integer(day) - 6, # X7 -> 7 -> 1
+      Date = as.Date(paste(X4, X5, day, sep = "-"))
+    )%>%
+
+
+    # get the right county code for X2
+    mutate(County.Code = X2 - 36000)%>%
+
+    # deselect all unnecessary columns
+    select(-c("X1", "X2", "X6", "State", "X4", "X5", "day"))
+
+  return(df_cleaned)
+
+}
+
+cleaned_temps = lapply(daily_temps, clean_weather_data, "daily.Avg.temp")
+cleaned_precipitation = lapply(daily_prcp, clean_weather_data, "daily.Avg.precipitation")
+
+# binding the rows
+daily_average_temperature = bind_rows(cleaned_temps)
+daily_average_precipitation = bind_rows(cleaned_precipitation)
+
+
+# freeing up RAM - can comment out if we want to keep the original datasets
+rm(files)
+rm(clean_weather_data)
+rm(daily_prcp)
+rm(daily_temps)
+rm(cleaned_temps)
+rm(cleaned_precipitation)
+```
+
+This analysis takes into account daily average temperature and precipitation to observe occurrences that might have an impact on traffic patterns and overall air quality. Daily climate summaries from 4/1/2018 to 12/31/2023 for all 133 counties in Pennsylvania  were collected from National Oceanic and Atmospheric Association.\footnote{NOAA, “Index of /Data/Nclimgrid-Daily/Archive,” accessed February 7, 2025, \url{https://www.ncei.noaa.gov/data/nclimgrid-daily/archive/}.} See section 3 in the Appendix for summary statistics.
+
+
+### d. Final dataset
+
+From 81,000 records for AQI indexes and 43,000 records for traffic volumes, merging by both county code and date results in a dataframe of 7831 records. From base volumes, delta change values were calculated for traffic and truck volumes. That is, "Volume Change" or "Delta.Traffic" is the difference between "Base Traffic" and "Current Traffic."
+
+Because traffic volume data was measured at the street level but on different dates, there were duplicated values when grouping data by county and date. Specifically, there may be multiple streets in a specific county, of which traffic counts were recorded in different date. When merged with weather and air quality data by county codes, there were many rows with different volume counts for the same county on the same date. This is a big problem because redundancy skews the distributions and misrepresents variables of interest.\footnote{Dataddo, “Data Duplication: Understanding and Resolving Common Issues,” accessed February 20, 2025, \url{https://docs.dataddo.com/docs/data-duplication}.} Therefore, the merged dataset was filtered by county code and date, and duplication was handled as follow:
+\begin{itemize}
+  \item \textbf{Traffic volume variables:} Taking the sum of all vehicle counts in a county on a specific date.
+  \item \textbf{AQI, average temperature, and average precipitation:} Taking the mean of these indicators for a county on a specific date. 
+  \item \textbf{Air Quality Category and Defining Parameter:} Taking the unique value across a county on a specific date. Because these categorical values are tied to county-specific information pre-merge, they should only have 1 unique value. 
+  \item \textbf{Traffic patterns:} Not including this variable because it is tied to street-specific information and cannot be tallied correctly across a county. 
+\end{itemize}
+
+The most problematic variable to handle was traffic pattern due to its inability to be represented fairly across a county. There is no good way to tally the type of roads being counted for traffic for a county on a specific date and compare such information to that of another county. Therefore, these patterns will not be a factor in the regression, though included in visualizations. The filtered dataset includes 1,460 rows and 13 features (see Table 1 for summary statistics of numerical values in the dataset).
+
+```{r, include=FALSE}
+# Merge and Clean the Data
+
+# inner joins by county code and date
+merged_dfs = AQIs_all%>%
+  inner_join(tv_subset_cleaned, by=c("County.Code", "Date"))%>%
+  inner_join(daily_average_precipitation, by=c("County.Code","Date"))%>%
+  inner_join(daily_average_temperature, by=c("County.Code","Date"))
+
+# Create columns for change in traffic and drop base traffic
+merged_dfs=merged_dfs%>%
+  mutate(Delta.Traffic = Current.Traffic - Base.Traffic)%>%
+  mutate(Delta.Truck = Current.Truck - Base.Truck)%>%
+  select(-Base.Traffic, - Base.Truck, -county.Name.x, -county.Name.y)
+
+filtered_df = merged_dfs%>%
+  group_by(County.Code, Date)%>%
+  summarise(across(c(AQI, daily.Avg.precipitation, daily.Avg.temp), mean),
+            across(c(Current.Truck, Delta.Truck, Current.Traffic, Delta.Traffic), sum),
+            across(c(Category, Defining.Parameter, county.Name), unique),
+            .groups="drop")
+
+# # remove values for runtime efficiency
+rm(tv_subset_cleaned)
+```
+
+```{r, echo=FALSE, results='asis'}
+#reference: https://cran.r-project.org/web/packages/stargazer/vignettes/stargazer.pdf
+num_df=filtered_df[,sapply(filtered_df, is.numeric)]
+num_df = subset(num_df, select = - County.Code)
+stargazer(as.data.frame(num_df), type = "latex", title = "Descriptive Statistics of Dataset", digits=1,header=FALSE,
+          covariate.labels = c("Air Quality Index", "Daily Average Precipitation",
+                               "Daily Average Temperature", "Truck Volume",
+                               "Change in Truck Volume", "Traffic Volume",
+                               "Change in Traffic Volume"))
+```
+\pagebreak
+
+## Preliminary Analysis
+
+The dataset is quite unbalanced, based on initial observation. Figures 1 provides snapshots of traffic information in the dataset, which is heavily biased towards local roads and main urban streets. This is simply due to data collection complexities as estimating traffic counts is resource-intensive when the street is not equipped with vision technology; thus, traffic counting is often done by private companies as opposed to public, government organization.\footnote{Sarah Penny, “6 Traffic Counts and Classification Study Methods,” \textit{SMATS} (blog), July 21, 2021, https://www.smatstraffic.com/2021/07/21/counts-and-classification-study-methods/; VentureRadar, “Top Traffic Counting Companies,” accessed February 20, 2025, \url{https://www.ventureradar.com/keyword/Traffic\%20Counting}.} We also see a long tail to the right of the histogram, even with outliers removed. We can expect the median and mean to be much great than the mode, or that our data contains outliers with very high traffic counts.
+          
+```{r, echo=FALSE, warning=FALSE}
+#| fig.cap: "Distribution of Traffic Volumes by Traffic Patterns"
+#| fig.width: 12
+#| fig.height: 7
+
+## If I don't move this graph here, the caption will refuse to show
+
+## Reference for plotting with outliers removed: https://rpubs.com/HaiyunYu/568280
+outlier_cutoff = quantile(merged_dfs$Current.Traffic,
+                          0.75) + 1.5 * IQR(merged_dfs$Current.Traffic)
+
+ggplot(data=merged_dfs[-which(merged_dfs$Current.Traffic>outlier_cutoff),],
+       mapping=aes(x=Current.Traffic, color=Traffic.Pattern, fill=Traffic.Pattern, alpha=0.2))+
+  geom_histogram(bins=20)+
+  labs(title="Histogram of Traffic Volume in PA", 
+       subtitle="By Traffic Patterns, Outliers Removed",
+       x="Traffic Volume", y="Absolute Frequency")+
+  theme(legend.position= c(0.8, 0.7))
+
+rm(outlier_cutoff)
+```
+
+
+We also observe imbalances in air quality attributes. Figure 2 demonstrates that the data contains mostly good and moderate air quality with defining parameters being almost exclusively "Ozone" and "PM2.5".Ozone is the main ingredient in "smog" while PM2.5 are micro-particles that can get into one's bloodstream.\footnote{OAR US EPA, “Health Effects of Ozone and Particulate Matter,” Other Policies and Guidance, June 21, 2022, \url{https://www.epa.gov/advance/health-effects-ozone-and-particulate-matter}.} When Ozone is a defining parameter for "Good" air quality, it might mean that the level of "smog" is low enough for the area to have healthy air. With PM2.5, however, we see that it more often defines less "Good" air quality. Figure 2 also seems relatively bell-shaped without outliers, centering around 40-50 in air quality.
+
+```{r, echo=FALSE, message=FALSE} 
+#| fig.cap: "Air Quality across PA Counties and Time"
+#| fig.width: 12
+#| fig.height: 7
+
+## Reference for plotting with outliers removed: https://rpubs.com/HaiyunYu/568280
+
+outlier_cutoff = quantile(filtered_df$AQI,0.75) + 1.5 * IQR(merged_dfs$AQI)
+
+ggplot(data=filtered_df[-which(filtered_df$AQI>outlier_cutoff),],
+       mapping=aes(x=AQI, color=Defining.Parameter, fill=Defining.Parameter, alpha=0.2))+
+  geom_histogram()+
+  scale_fill_manual(values=c("#002a86","#ffce00","#D10B10","#076a21","#414141"))+
+  scale_color_manual(values=c("#002a86","#ffce00","#D10B10","#076a21","#414141"))+
+  labs(title="Histogram of Air Quality Index in Pennsylvania", 
+       subtitle="By Defining Parameter, Outliers Removed",
+       x="AQI", y="Absolute Frequency")
+
+rm(outlier_cutoff)
+```
+Finally, there are imbalances in the counties represented (Figure 3), which can be due to differences in the number of streets with traffic counts recorded between 2018 and 2023. Counties with more representation such as Allegheny, Cambria, and Dauphin are reasonably justified since they have more streets operating in and pouring \textit{into} big cities (Pittsburgh, Harrisburg, etc.). Bradford being the most represented county is quite surprising as it is a small, rural county.\footnote{Bradford County, “Visit Bradford County,” accessed February 20, 2025, \url{https://bradfordcountypa.org/visitors/}.} 
+
+
+```{r, echo=FALSE}
+#| fig.cap: "Absolute Frequency of PA Counties"
+#| fig.width: 12
+#| fig.height: 6
+ggplot(filtered_df, aes(x=county.Name))+
+  geom_bar(stat="count", fill="#002A86")+
+  labs(title="Frequency Distribution of PA Counties Recorded in the Dataset", 
+       subtitle="Total: 21 Unique Counties", 
+       y="Absolute Frequency",x="PA Counties")+
+  theme(axis.text.x=element_text(angle=90))
+```
+
+Before moving to statistical analysis, plotting a correlation heat map of all numerical variables (Figure 4) is helpful. We see a strong relationship between traffic count variables and little relationship elsewhere. It is intuitive to see the traffic count correlations because high traffic volume might also mean a stark deviation from historical counts. Moreover, it is reasonable to expect a high truck volume when there is a high traffic volume for certain streets.
+
+Initial visualizations have not only reveal imbalances in the data but also imply innate differences between counties. Accounting for these differences will allow us to make causal inferences, building a stronger case to justify the relationship, or lack thereof, between variables compared to a regular regression model.
+
+```{r, echo=FALSE}
+#| fig.cap: "Correlation Heat Map Across Numerical Variables" 
+#| fig.width: 7
+#| fig.height: 5
+
+corr_ma = round(cor(num_df, use="pairwise.complete.obs"),2)
+ggcorrplot(corr_ma, type="lower",lab=TRUE)+
+  labs(title="Correlation Heat Map", 
+       subtitle = "Between Traffic Volumes, Air Quality, and Weather Conditions")
+
+rm(corr_ma)
+```
+
+
+## Statistical Test
+### a. Ordinary Least Square
+
+After conducting variable selection (see section 8 in the Appendix), the recommended regression involves: average daily precipitation, average daily temperature, traffic volume, change in traffic volume, air quality categories, defining parameters, and \textit{county names}. In other words, the "best" ols model suggests accounting for differences between counties.
+
+\pagebreak
+
+For this "best" ols model (see Table 2), we see some significant positive relationship between AQI and traffic volume, indicating that more traffic is related to higher AQI (more unhealthy air). However, the negative significant coefficent for \textit{change} in traffic volume seems to contradict the traffic volume - AQI relationship above it: More traffic \textit{than usual} correlates to a decrease in AQI (healthier air). We also established the strong, positive correlation between traffic volume and change in traffic volume in the last section, so this ols result seems unjustifiable.
+
+```{r, echo = FALSE, warning=FALSE, results="asis"}
+
+ols_revised <- lm(AQI ~ daily.Avg.precipitation + daily.Avg.temp + 
+                    Current.Traffic + Delta.Traffic + factor(Category) + 
+                    factor(Defining.Parameter) +factor(county.Name), data=filtered_df)
+
+#Reference: ChatGPT
+stargazer(ols_revised, type = "latex", single.row = TRUE, header=FALSE)
+```
+
+Figure 5 plots the relationship between traffic volume change and AQI. We see that most values are concentrated in the bottom left corner where AQI and volume change are low, showing that Pennsylvania counties have good air quality and relatively slow-changing traffic volume. Moreover, there are no data in the top right corner (more traffic than usual and high AQI index), which does not corroborate common understanding of car exhaust's impact to air quality.\footnote{David L Buckeridge et al., “Effect of Motor Vehicle Emissions on Respiratory Health in an Urban Area.,” \textit{Environmental Health Perspectives} 110, no. 3 (March 2002): 293–300.} There are also strong outliers that might have affected the regression model. These confusing conclusions are warning signs that an ols might not be the best option for this dataset.
+
+```{r, echo=FALSE, message=FALSE}
+#| fig.cap: "Relationship between Change in Traffic Volume and Air Quality" 
+#| fig.width: 12
+#| fig.height: 6
+
+ggplot(data=filtered_df, 
+       mapping=aes(x=Delta.Traffic, y=AQI))+
+  geom_point()+
+  geom_smooth()+
+  labs(x="Change in Traffic Volume", title = "Scatter Plot between AQI and Change in Traffic Volume")
+
+```
+
+
+### b. Panel Regression Models
+We move on to panel regression models. Due to the nature of panel regression (controlling for innate differences between counties and date), we only need to pass our variables of interest (traffic volume) to the model and not concern about colinearity. I built a fixed-effects model and a random-effects model with traffic volume, truck volume, change in traffic volume, and change in truck volume as independent variables to AQI. I then employed different statistical tests to choose the best model among my fixed-effects, random-effects, and ols models. See section 8 in the Appendix for more details on my comparison tests.
+
+The best model for this data is a random effects model that concludes no significant relationship between any traffic variables to AQI (see Table 3). 
+
+```{r, echo=FALSE, results='asis'}
+random <- plm(AQI ~ Current.Traffic+Current.Truck+Delta.Traffic+Delta.Truck,
+             data=filtered_df, index=c("Date","County.Code"), model="random")
+
+stargazer(random, type = "latex", single.row = TRUE, header=FALSE, table.placement = "H") 
+```
+
+I performed the Breusch-Pagan Lagrange multiplier test and found a significant p-value, rejecting the null hypothesis that there exists no significant differences across units. We accept the alternative hypothesis that the data has panel effects.\footnote{Oscar Torres-Reyna, "Getting Started in Fixed/Random Effects", 19.}
+
+```{r, echo=FALSE}
+pool <- plm(AQI ~ Current.Traffic + Delta.Traffic + Current.Truck + Delta.Truck, model = "pooling", index = c("County.Code", "Date"), data = filtered_df)
+
+plmtest(pool, type=c("bp"))
+```
+
+Through this section, we arrive at the following key conclusions:
+\begin{itemize}
+  \item The data has panel effects that are more appropriately modeled through panel regression, specifically a random-effects model.
+  \item The results of the random-effects model shows no relationship between AQI and traffic/truck volume, controlling for differences between counties in PA over time.
+  \item This is not to say that exhaust fumes are not linked to air pollution because this analysis is constrained within specific Pennsylvania counties on specific dates in time. It might also show the value and effectiveness of air quality monitoring efforts and car emission controls in Pennsylvania.
+\end{itemize}
+
+### c. Clustering with DBSCAN:
+I will conduct clustering through the DBSCAN algorithm. DBSCAN stands for density-based spatial clustering of applications with noise, which not only identifies outliers in hyper-dimensional planes but also does not assume that the data clusters by spherical shapes.\footnote{Okan Yenigun, “DBSCAN Clustering Algorithm Demystified,” Built In, March 11, 2024, \url{https://builtin.com/articles/dbscan}.} We first plot a k-NN distance plot to determine the best epsilon hyperparameter (the elbow of the plot) for a chosen k nearest neighbors.\footnote{STHDA, “DBSCAN: Density-Based Clustering for Discovering Clusters in Large Datasets with Noise - Unsupervised Machine Learning - Easy Guides,” accessed February 21, 2025, \url{https://www.sthda.com/english/wiki/wiki.php?id_contents=7940}.} k is typically chosen to be twice the dimension of the dataset.\footnote{Tara Mullin, “DBSCAN Parameter Estimation Using Python,” \textit{Medium} (blog), July 15, 2020, \url{https://medium.com/@tarammullin/dbscan-parameter-estimation-ff8330e3a3bd}.} Since we have 12 variables in the filtered dataset, I chose k = 24.
+
+```{r, echo=FALSE}
+#| fig.cap: "24-NN Distance Plot"
+#| fig.width: 12
+#| fig.height: 6
+
+#reference: https://www.sthda.com/english/wiki/wiki.php?id_contents=7940
+
+# scale the points
+cluster_df = scale(num_df)
+
+# determine best neighbor - eps 
+dbscan::kNNdistplot(cluster_df, k = 24)
+abline(h = 3.4, lty = 2)
+```
+
+Around a height of 3.4 is where I determined the elbow of the 24-NN distance plot. I passed the scaled, filtered data to a DBSCAN algorithm with eps = 3.4 and MinPts = 24. The model, surprisingly, found only two clusters: 0 and 1 where 0 are the "noises" or outliers in hyperdimensional planes. 
+
+```{r, include=FALSE}
+# Compute DBSCAN using fpc package
+set.seed(123)
+db <- fpc::dbscan(cluster_df, eps = 3.4, MinPts = 24)
+```
+
+Figure 7 plots the data on the AQI - Traffic Volume plane and colors the points by their cluster assignments. We can clearly see the points on the far left and top right are considered "outliers" by DBSCAN. This result seems intuitive and justifiable considering the large distance between these points to the bottom right corner where most points gather.
+
+```{r, echo=FALSE}
+#| fig.cap: "Traffic Volume and AQI by DBSCAN clusters"
+#| fig.width: 12
+#| fig.heigth: 6
+
+# Add cluster assignments to the data frame
+temp = data.frame(filtered_df)
+temp$cluster <- factor(db$cluster)
+
+# Plot DBSCAN results
+ggplot(data = temp, 
+       mapping = aes(x = Current.Traffic, y = AQI, color = cluster)) +
+  geom_point() +
+  labs(x = "Traffic Volume", y = "Air Quality Index (AQI)", color = "Cluster",
+       title = "Scatter Plot between Traffic Volume and AQI",
+       subtitle="By DBSCAN Clusters")
+
+rm(temp)
+
+```
+
+
+## Conclusion and Future Work
+Through this project, I explored panel regression techniques in R that control for innate differences in place and time, resulting in a more trustworthy regression model for data with panel effects. The overall conclusion is that there is not enough evidence to affirm a relationship between traffic volume and air quality in specific Pennsylvania counties from April 2018 to December 2023. This is not to refuse robust, scientific research that links air pollution to car exhaust fumes.\footnote{David L Buckeridge et al., “Effect of Motor Vehicle".} However, it is supportive evidence that Pennsylvania's environmental policies, air quality monitoring efforts, and stringent exhaust controls might have played a role in providing clean air for residents.\footnote{Arthur van Benthem et al., “How Effective Are Vehicle Exhaust Standards?,” \textit{Kleinman Center for Energy Policy} (blog), December 7, 2022, \url{https://kleinmanenergy.upenn.edu/research/publications/how-effective-are-vehicle-exhaust-standards/}.}
+
+This analysis can be improved through better traffic volume data, potentially collected by a private entity with more resources. I recommend county-level data, aggregating traffic counts of all streets in a county. I also believe there are gaps in the data between April 2018 and December 2023. Not all dates were represented, which might have impacted my coefficients.
+
+\pagebreak
+
+## Appendix
+
+### 1. Descriptive table for pre-merge AQI dataset:
+
+```{r, echo=FALSE}
+AQIs_all%>%
+  group_by(Category)%>%
+  summarise(Min.AQI=min(AQI), Max.AQI = max(AQI), Mean.AQI=mean(AQI),Standard.Deviation=sd(AQI))%>%
+  arrange(Max.AQI)%>%
+  kable(col.names=c("Category", "Min AQI", "Max AQI", "Mean", "Standard Deviation"),
+        caption="Summary Statistics of Pennsylvania AQI",
+        digits=2)%>%
+  kable_styling(bootstrap_options="striped")
+
+rm(AQIs_all)
+          
+```
+
+### 2. Example of pre-merge traffic volume data, mapped onto York County, PA:
+
+```{r, echo=FALSE}
+#| fig.cap: "Example of Traffic Volume Data Recorded for York County"
+#| fig.height: 10
+#| fig.width: 10
+#| fig.fullwidth: TRUE
+#| fig.fullheight: TRUE
+#| fig.keep: "all"
+#| results: "hide"
+
+PA_sf <- st_read(file.path("./RMSTRAFFIC_(Traffic_Volumes)/RMSTRAFFIC_(Traffic_Volumes).shp"))
+
+temp=filter(PA_sf, CTY_CODE == 67)
+
+ggplot(temp) +
+  geom_sf(aes(col = CUR_AADT))+
+  labs(title="Average Daily Traffic on York County Road Networks", 
+       color="Average Daily Traffic", subtitle="Excluding Truck Traffic")
+ 
+rm(temp)
+rm(PA_sf)
+```
+
+### 3. Summary statistics for pre-merge temperature and precipitation data:
+
+```{r, echo=FALSE}
+# Summarize average temperature and precipitation data
+daily_average_temperature%>%
+  inner_join(daily_average_precipitation, by=c("Date","County.Code"))%>%
+  select(Date, County.Code, daily.Avg.temp, 
+         daily.Avg.precipitation)%>%
+  summary()%>%
+  kable(col.names=c("Date","County Code", "Temperature","Precipitation"),
+     caption = "Summary Statistics for Daily Average Temperature and Precipitation in Pennsylvania",
+     digits=2)%>%
+  kable_styling(bootstrap_options="striped")
+
+rm(daily_average_precipitation)
+rm(daily_average_temperature)
+```
+
+
+### 4. Frequency distribution of Traffic Patterns:
+
+This section illustrates imbalances in traffic variables.
+
+```{r, echo=FALSE}
+#|fig.cap: "Initial Visualization of Traffic Patterns"
+#|fig.width: 12
+#|fig.height: 7
+
+ggplot(merged_dfs, aes(x=Traffic.Pattern))+
+  geom_bar(stat="count", fill="#002A86")+
+  labs(title="Frequency Distribution of Traffic Patterns", 
+       subtitle="Total: 12 Unique Patterns", 
+       y="Absolute Frequency", x="Traffic Patterns")+
+  coord_flip()
+
+```
+
+### 5. Frequency of defining parameters by air quality category:
+
+This section illustrates imbalances in air quality variables.
+
+
+```{r, echo=FALSE}
+#| fig.cap: "Initial Visualization of Defining Air Quality Parameters"
+#| fig.width: 12
+#| fig.height: 7
+
+ggplot(filtered_df, mapping = aes(x = Defining.Parameter)) +
+  geom_bar(aes(fill = Category), position = "dodge") +
+  scale_fill_manual(values = c("#007f00", "#66b266", "#ffff66", "#ff9933", "#cc0000")) +  # Green to Red
+  scale_color_manual(values = c("#007f00", "#66b266", "#ffff66", "#ff9933", "#cc0000")) +
+  labs(
+    title = "Frequency of Defining Parameters by Air Quality Category",
+    x = "Defining Parameters",
+    y = "Absolute Frequency"
+  )
+```
+### 6. Trends in temperature and precipitation over time:
+
+We clearly see seasonality with daily temperature due to natural seasonal changes in Pennsylvania, which might impact the regression analysis in unpredictable ways. 
+
+```{r, echo=FALSE}
+#| fig.cap: "Time Series Visualization of Average Temperature"
+#| fig.width: 12
+#| fig.height: 7
+
+ggplot(data=filtered_df, mapping=aes(x=Date,y=daily.Avg.temp))+
+  geom_point(color="#82cce2")+
+  geom_smooth(color="#002a86")+
+  labs(title="Daily Average Temperature (in Celcius) Recorded", 
+       subtitle="From 2018 to 2024", y="Daily Average Temperature")
+```
+
+For precipitation, we do not see a clear linear trend, but there seems to be gaps in the dataset. Pennsylvania seems to be a dry area in general with some scattered rainy days throughout a year.
+
+```{r, echo=FALSE}
+#| fig.cap: "Time Series Visualization of Average Precipitation"
+#| fig.width: 12
+#| fig.height: 7
+
+## Reference for plotting with outliers removed: https://rpubs.com/HaiyunYu/568280
+outlier_cutoff = quantile(filtered_df$daily.Avg.precipitation,
+                          0.75) + 1.5 * IQR(filtered_df$daily.Avg.precipitation)
+ggplot(data=filtered_df[-which(filtered_df$daily.Avg.precipitation>outlier_cutoff),], 
+       mapping=aes(x=Date, y=daily.Avg.precipitation))+
+  geom_point(color="#82cce2")+
+  geom_smooth(color="#002a86")+
+  labs(title="Daily Average Precipitation Recorded", 
+       subtitle="From 2018 to 2024, Outliers Removed", y="Daily Average Precipitation")
+
+rm(outlier_cutoff)
+
+```
+
+### 7. Plots of AQI over time by counties:
+
+While we see some trends in AQI between certain counties spiking near 2024, AQI values seem quite different between counties in general.
+
+```{r, echo=FALSE}
+#| fig.cap: "AQI over time, deaggregated by counties"
+#| fig.width: 15
+#| fig.height: 15
+#Reference for coplot: https://www.princeton.edu/~otorres/Panel101R.pdf
+coplot(AQI ~ Date|county.Name, type="l", data= filtered_df)
+
+```
+
+The following plot shows differences in AQI mean between counties, reiterating the idea that an ols model might not account for heterogeineity across groups over time.
+
+```{r, echo=FALSE}
+#| fig.cap: "Differences in AQI means across counties"
+#| fig.width: 12
+#| fig.height: 7
+
+# Reference: most if not all codes in this section on panel regression is adopted from https://www.princeton.edu/~otorres/Panel101R.pdf
+
+plotmeans(AQI ~ County.Code, main="Heterogeineity across Counties", data=filtered_df, n.label=FALSE, xlab="County Code")
+
+```
+
+### 8. Variable selection for Ordinary Least Square:
+
+I started with a simple regression model between traffic volume (traffic/truck counts and changes) with AQI values without adding the remaining variables. The regression shows a strong relationship between change in traffic volume and change in truck volume with air quality, but the coefficients are quite contradictory: While traffic volume change and AQI is inversely related (an increase in one leads to a decrease in the other), truck volume change and AQI is not. Moreover, a small AQI means healthier air quality, so an increase in traffic leading to a smaller AQI seems deviant from our expectations. This result cannot be intuitively interpreted and justified.
+
+```{r, echo=FALSE}
+ols_traffic <- lm(AQI ~ Current.Traffic + Delta.Traffic +
+                    Current.Truck + Delta.Truck, data=filtered_df)
+summary(ols_traffic)
+```
+
+I then pass all the data through a step function to get the "best" ols model.
+
+```{r, echo=FALSE}
+ols_all = lm(AQI~., data = filtered_df)
+step(ols_all)
+```
+
+### 9. Compare between fixed-effects, random-effects, and ols models:
+
+The following fixed-effects model shows no relationship between AQI and traffic volume across counties between 2018 and 2023. 
+
+```{r, echo=FALSE}
+fixed <- plm(AQI ~ Current.Traffic+Current.Truck+Delta.Traffic+Delta.Truck,
+             data=filtered_df, index=c("Date","County.Code"), model="within")
+
+summary(fixed)
+```
+
+We arrive at the same conclusion of no significant relationship with a random-effects model. 
+
+To choose the most appropriate model, we can conduct a Hausman test.\footnote{Oscar Torres-Reyna, "Getting Started in Fixed/Random
+Effects Models using R/RStudio," 16} With p-value > 0.05, we fail to reject the null hypothesis that unique errors are not correlated with the regressors.\footnote{Ibid, 16} We should use the random-effects model.
+
+```{r, echo=FALSE}
+phtest(fixed,random)
+```
+
+Using a simple F test for effects, we can also see that the fixed-effects model is still better than ols. At a p-value > 0.05, we fail to reject the null that the "best" ols model is better than than the fixed-effects model.\footnote{Ibid, 12.}
+
+```{r, echo=FALSE}
+pFtest(fixed, ols_revised)
+
+rm(ols_all)
+rm(ols_revised)
+rm(ols_traffic)
+rm(pool)
+rm(random)
+rm(fixed)
+```
+### 10. More detail on cluster 0:
+
+The following plot shows the hyperdimensional outliers and specifies the county of each point. Among the outliers, we see two groups: high AQI, low traffic volume and low AQI, (mostly) high traffic volume. This inverse relationship contradicts common understand of the relationship between air quality and car exhaust fumes; thus, it is reasonable for them to be "outliers" compared to other points. We also see that Bradford and Cambria appear more often than other counties (4 points each), which is consistent with the imbalances inherent in the dataset. 
+
+```{r, echo=FALSE}
+#| fig.cap: "Characteristics of Counties in Cluster 0"
+#| fig.width: 12
+#| fig.height: 7
+
+# reference: Used ChatGPT to code the 11 distinct colors and assign 11 shapes with heavier outlines 
+
+# Plot DBSCAN results
+temp = data.frame(filtered_df)
+temp$cluster <- factor(db$cluster)
+cluster0 = temp[temp$cluster=="0",]
+rm(temp)
+rm(db)
+rm(num_df)
+rm(cluster_df)
+
+ggplot(data = cluster0, 
+       mapping = aes(x = Current.Traffic, y = AQI, color = county.Name, shape = county.Name))+
+  geom_point(size=4, stroke=1.5) +
+  scale_shape_manual(values = c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10))+
+  scale_color_manual(values = c("#E41A1C",  # Red
+                                "#377EB8",  # Blue
+                                "#4DAF4A",  # Green
+                                "#984EA3",  # Purple
+                                "#FF7F00",  # Orange
+                                "#FFFF33",  # Yellow
+                                "#A65628",  # Brown
+                                "#F781BF",  # Pink
+                                "#999999",  # Grey
+                                "#66C2A5",  # Teal
+                                "black")) +  # Black
+  labs(x = "Traffic Volume", y = "Air Quality Index (AQI)",  
+       color = "County Name", shape = "County Name",
+       title= "Description of Outlier Counties in Cluster 0", 
+       subtitle = "By Air Quality and Traffic Volume")
+
+
+```
+
+I want to provide some insights on these intense deviations from the norm. Extreme AQI values might just be a special weather event happening in the county that has no relevance to traffic for that date. Table 4 summarizes the date, AQI, and traffic volumes of all records in cluster 0. For the first record of Allegheny county on June 29, 2023, there was a wildfire in Canada, of which smoke traveled to the county and tanked air quality.\footnote{CBS Pittsburgh, “Canadian Wildfire Smoke Creates Unhealthy Air Quality across Pittsburgh Area,” June 30, 2023, \url{https://www.cbsnews.com/pittsburgh/live-updates/live-updates-canadian-wildfire-smoke-clouds-pittsburgh-skies-air-quality-alerts-issued-for-western-pa/}.} 
+
+In terms of traffic volume, due to the differences between the number of streets in a county as well as imbalances in the dataset, an intense traffic volume might just be due to the data cleaning process where traffic counts for each street on a particular date is added together, which has no relationship to AQI. An ols regression might be quite vulnerable to these data points, which is why controlling for differences between counties \textit{and} dates is important.
+
+```{r, echo=FALSE}
+
+cluster0%>%
+  select(county.Name, Date, AQI, Current.Traffic)%>%
+  kable(col.names=c("County", "Date", "AQI", "Traffic Volume"),
+        caption="Counties and Dates in Cluster 0",
+        digits=2)%>%
+  kable_styling(bootstrap_options="striped")
+```
